@@ -23,33 +23,6 @@ import storage
 from log_forwarder import log
 
 
-# Stamp the runtime commit at module-import time so we can tell which SHA a
-# worker is actually running. start.sh exports RUNTIME_COMMIT during boot;
-# fall back to git rev-parse if it's not set (e.g. FlashBoot resume restored
-# a Python process without re-running start.sh). See bead 6i0.
-def _resolve_runtime_commit() -> str:
-    env = os.environ.get("RUNTIME_COMMIT")
-    if env:
-        return env
-    try:
-        here = os.path.dirname(os.path.abspath(__file__))
-        sha = subprocess.check_output(
-            ["git", "-C", here, "rev-parse", "--short", "HEAD"],
-            text=True, stderr=subprocess.DEVNULL,
-        ).strip()
-        subj = subprocess.check_output(
-            ["git", "-C", here, "log", "-1", "--pretty=%s"],
-            text=True, stderr=subprocess.DEVNULL,
-        ).strip()
-        return f"{sha}: {subj}"
-    except Exception:
-        return "unknown"
-
-
-RUNTIME_COMMIT = _resolve_runtime_commit()
-print(f"[worker] loaded runtime commit {RUNTIME_COMMIT}", flush=True)
-
-
 # --- Model hash cache (persisted on network volume) ---
 _HASH_CACHE_PATH = "/runpod-volume/.model-hash-cache.json"
 _hash_cache: dict[str, dict] = {}  # {path: {sha256, size, mtime}}
@@ -869,13 +842,7 @@ def handler(job: dict) -> dict:
 
             _send_progress(job, stage, msg, percent=pct, **extra)
             prefix = f"({completed}/{total}) " if total > 0 and completed > 0 else ""
-            log_line = f"{stage}: {prefix}{msg}"
-            # Dedupe identical lines (bead 9oi): nodes like ImageUpscaleWithModel
-            # emit ~150 identical progress ticks per call. RunPod IN_PROGRESS
-            # still fires every tick — only the log is throttled.
-            if log_line != getattr(on_progress, '_last_line', None):
-                on_progress._last_line = log_line
-                jlog.info(log_line)
+            jlog.info(f"{stage}: {prefix}{msg}")
 
         history = comfy_client.poll_completion(
             prompt_id,
