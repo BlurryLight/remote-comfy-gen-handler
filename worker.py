@@ -919,7 +919,9 @@ def handler(job: dict) -> dict:
         jlog.info(f"@@JOB_END {job_id}")
 
         # --- Build output in standard convention ---
-        # Primary output: prefer video, fall back to image
+        # Primary output: prefer video, fall back to image.
+        # Also include every generated artifact so clients can surface
+        # multi-image / multi-video batches instead of only the first file.
         primary = None
         primary_path = None
         if output_videos:
@@ -929,7 +931,16 @@ def handler(job: dict) -> dict:
             primary = output_images[0]
             primary_path = results["images"][0]["path"]
 
-        output = {"url": primary["url"] if primary else None}
+        all_outputs = [
+            {**item, "media_type": "video"} for item in output_videos
+        ] + [
+            {**item, "media_type": "image"} for item in output_images
+        ]
+
+        output = {
+            "url": primary["url"] if primary else None,
+            "outputs": all_outputs,
+        }
 
         seed = _extract_seed(workflow)
         if seed is not None:
@@ -944,7 +955,12 @@ def handler(job: dict) -> dict:
 
         # See sleep comment in except block — same race condition applies
         time.sleep(1)
-        return {"ok": True, "output": output}
+        return {
+            "ok": True,
+            "output": output,
+            "images": output_images,
+            "videos": output_videos,
+        }
 
     except Exception as e:
         elapsed = int(time.time() - start_time)
