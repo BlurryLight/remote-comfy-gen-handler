@@ -633,6 +633,9 @@ def handler(job: dict) -> dict:
     if command == "volume_info":
         import volume_info_handler
         return volume_info_handler.handle(job)
+    if command == "hash":
+        import hash_handler
+        return hash_handler.handle(job)
 
     start_time = time.time()
     job_id = job.get("id", "unknown")
