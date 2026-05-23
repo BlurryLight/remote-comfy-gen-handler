@@ -38,6 +38,33 @@ if [ -f "$COMFYUI_DIR/extra_model_paths.yaml" ]; then
     echo "[start] Using extra_model_paths.yaml for network volume models"
 fi
 
+# --- Hotpatch kijai/ComfyUI-WanAnimatePreprocess for ONNX dropdown bug (issue #32) ---
+# folder_paths caches the detection folder's filename list under the default
+# extensions (no .onnx) when ANY earlier-loading node calls
+# get_filename_list("detection") before this node registers .onnx. Patch the
+# node to add .onnx and invalidate the cache, idempotently.
+WANIMATE_NODES="$COMFYUI_DIR/custom_nodes/ComfyUI-WanAnimatePreprocess/nodes.py"
+if [ -f "$WANIMATE_NODES" ] && ! grep -q "filename_list_cache" "$WANIMATE_NODES"; then
+    python3 - "$WANIMATE_NODES" <<'PYEOF' && echo "[start] Hotpatched WanAnimatePreprocess for ONNX dropdown bug"
+import sys, pathlib
+p = pathlib.Path(sys.argv[1])
+src = p.read_text()
+trigger = 'folder_paths.add_model_folder_path("detection", os.path.join(folder_paths.models_dir, "detection"))'
+patch = '''
+# --- onnx-dropdown hotpatch (kijai issue #32): register .onnx, invalidate cache ---
+if "detection" in folder_paths.folder_names_and_paths:
+    _paths, _exts = folder_paths.folder_names_and_paths["detection"]
+    folder_paths.folder_names_and_paths["detection"] = (_paths, set(_exts) | {".onnx"})
+    if hasattr(folder_paths, "filename_list_cache") and "detection" in folder_paths.filename_list_cache:
+        del folder_paths.filename_list_cache["detection"]
+    if hasattr(folder_paths, "cache_helper"):
+        folder_paths.cache_helper.clear()
+'''
+if trigger in src and "filename_list_cache" not in src:
+    p.write_text(src.replace(trigger, trigger + patch))
+PYEOF
+fi
+
 # --- Start ComfyUI, tee output to log file for IMPORT FAILED detection ---
 cd "$COMFYUI_DIR"
 # Experimental performance flags (enable via EXPERIMENTAL=true env var)
