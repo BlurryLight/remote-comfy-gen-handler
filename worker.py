@@ -362,7 +362,7 @@ def _compute_model_hashes(workflow: dict) -> dict:
     return result
 
 
-MODEL_EXTENSIONS = (".safetensors", ".gguf", ".ckpt", ".pth", ".pt", ".bin")
+MODEL_EXTENSIONS = (".safetensors", ".gguf", ".ckpt", ".pth", ".pt", ".bin", ".onnx")
 
 
 def _scan_all_model_refs(workflow: dict) -> list[dict]:

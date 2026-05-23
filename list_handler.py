@@ -18,7 +18,7 @@ VOLUME_MODELS = "/runpod-volume/ComfyUI/models"
 EXTRA_PATHS_FILE = "/ComfyUI/extra_model_paths.yaml"
 
 # File extensions we care about
-MODEL_EXTENSIONS = {".safetensors", ".ckpt", ".pt", ".pth", ".bin"}
+MODEL_EXTENSIONS = {".safetensors", ".ckpt", ".pt", ".pth", ".bin", ".onnx", ".gguf"}
 
 
 def _read_extra_paths(model_type: str) -> list[str]:
