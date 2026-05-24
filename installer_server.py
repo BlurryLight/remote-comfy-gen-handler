@@ -198,9 +198,20 @@ async def handle_install(request: web.Request) -> web.StreamResponse:
 
     task = asyncio.create_task(run_install())
 
+    # Keepalive cadence: RunPod's HTTP proxy idle-kills connections after
+    # ~100s of silence. download_handler only emits per-file events, which can
+    # be many minutes apart on multi-GB downloads, so we send an SSE comment
+    # line every KEEPALIVE_SEC. Comment lines (prefix `:`) are ignored by SSE
+    # consumers — they exist exactly for this case.
+    KEEPALIVE_SEC = 20
     try:
         while True:
-            event = await queue.get()
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=KEEPALIVE_SEC)
+            except asyncio.TimeoutError:
+                await resp.write(b": keepalive\n\n")
+                state.touch()
+                continue
             if event is None:
                 break
             await resp.write(f"data: {json.dumps(event)}\n\n".encode())

@@ -145,6 +145,7 @@ def _download_url(
     job: dict | None = None,
     item_index: int = 0,
     total_items: int = 1,
+    progress_callback: Callable[[dict], None] | None = None,
 ) -> dict:
     """Download a file from a direct URL using aria2c with progress streaming.
 
@@ -204,6 +205,14 @@ def _download_url(
                         f"{filename} {dl_pct}%{speed_str}",
                         percent=overall_pct,
                     )
+                    if progress_callback:
+                        progress_callback({
+                            "type": "download_progress",
+                            "file_index": item_index,
+                            "file": filename,
+                            "percent": dl_pct,
+                            "speed": speed or "",
+                        })
     except Exception:
         pass
 
@@ -354,6 +363,7 @@ def handle(job: dict, progress_callback: Callable[[dict], None] | None = None) -
                 info = _download_url(
                     url, dest_dir, filename,
                     job=job, item_index=i, total_items=len(downloads),
+                    progress_callback=progress_callback,
                 )
 
         else:
