@@ -24,6 +24,7 @@ import os
 import re
 import subprocess
 import time
+from typing import Callable
 
 import runpod
 
@@ -241,8 +242,15 @@ def _resolve_target(dl: dict) -> tuple[str, str]:
     return dest, dl.get("filename")
 
 
-def handle(job: dict) -> dict:
+def handle(job: dict, progress_callback: Callable[[dict], None] | None = None) -> dict:
     """Handle a download command job.
+
+    `progress_callback`, when supplied, receives structured events instead of
+    (and in addition to) the runpod harness's progress_update path — used by
+    the installer pod's aiohttp server to bridge into an SSE stream. Event
+    shapes: {"type": "download_start"|"download_done"|"download_progress",
+    "file_index": int, ...}. When None (default), the legacy harness path is
+    used; existing callers behave exactly as before.
 
     Expected input:
     {
@@ -299,6 +307,17 @@ def handle(job: dict) -> dict:
 
         pct = (i / len(downloads)) * 100
         _send_progress(job, f"Downloading {i+1}/{len(downloads)}", percent=pct)
+        if progress_callback:
+            # `file` resolved best-effort here so the SSE consumer sees the
+            # final filename even when civitai derives it post-download.
+            announced_name = override_filename
+            if source == "url" and not announced_name:
+                announced_name = (dl.get("url") or "").rstrip("/").rsplit("/", 1)[-1].split("?")[0]
+            progress_callback({
+                "type": "download_start",
+                "file_index": i,
+                "file": announced_name or "",
+            })
 
         if source == "civitai":
             version_id = dl.get("version_id")
@@ -361,6 +380,15 @@ def handle(job: dict) -> dict:
         info["bytes"] = os.path.getsize(info["path"])
         results.append(info)
         print(f"[job {job_id[:8]}] Downloaded: {info['filename']} ({info['size_mb']} MB, cached={cached})")
+        if progress_callback:
+            progress_callback({
+                "type": "download_done",
+                "file_index": i,
+                "file": info["filename"],
+                "cached": cached,
+                "bytes": info["bytes"],
+                "sha256": info.get("sha256"),
+            })
 
     elapsed = int(time.time() - start_time)
     _send_progress(job, f"Done — {len(results)} file(s) in {elapsed}s", percent=100)
