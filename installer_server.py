@@ -91,6 +91,7 @@ def _preflight_check(preset: dict, free_bytes: int) -> dict | None:
     if total_bytes and total_bytes > free_bytes:
         return {
             "type": "preflight_fail",
+            "error_code": "preflight_disk_full",  # see comfy_gen/_install_error_codes.py
             "reason": f"need {total_bytes} bytes, have {free_bytes}",
             "need_bytes": total_bytes,
             "free_bytes": free_bytes,
@@ -152,6 +153,7 @@ async def handle_install(request: web.Request) -> web.StreamResponse:
             except KeyError as exc:
                 await _emit_async(queue, {
                     "type": "preflight_fail",
+                    "error_code": "preflight_preset_not_found",  # see comfy_gen/_install_error_codes.py
                     "reason": str(exc),
                 })
                 return
@@ -182,9 +184,14 @@ async def handle_install(request: web.Request) -> web.StreamResponse:
                     lambda: download_handler.handle(job, progress_callback=emit),
                 )
             except Exception as exc:  # noqa: BLE001 — surface everything as one event
+                # Classify into error_code per comfy_gen/_install_error_codes.py.
+                # Worker can't import comfy_gen at runtime — keep this in sync.
+                msg = str(exc).lower()
+                error_code = "sha_mismatch" if "sha256 mismatch" in msg else "download_failed"
                 await _emit_async(queue, {
                     "type": "install_error",
                     "stage": "download",
+                    "error_code": error_code,
                     "reason": f"{type(exc).__name__}: {exc}",
                 })
                 return
