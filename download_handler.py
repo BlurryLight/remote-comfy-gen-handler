@@ -24,12 +24,89 @@ import os
 import re
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from typing import Callable
 
 import runpod
 
 MODELS_BASE = "/runpod-volume/ComfyUI/models"
 CIVITAI_SCRIPT = "/tools/civitai-downloader/download_with_aria.py"
+CIVITAI_API_BASE = "https://civitai.com/api/v1"
+
+
+def _civitai_version_metadata(version_id: str, token: str | None = None) -> dict | None:
+    """Look up a CivitAI model version's primary file metadata.
+
+    Hits `GET /api/v1/model-versions/{version_id}` and returns
+    `{"filename": str, "sha256": str}` for the primary file, or None if the
+    call fails, the version isn't published, or no SHA256 hash is reported.
+
+    Used to skip the download subprocess when a file with the expected hash
+    already lives on the network volume — same content-addressable dedup the
+    URL download path already does, just sourced from the CivitAI API instead
+    of caller-supplied metadata. Schema confirmed via Context7 against
+    https://developer.civitai.com (per-file `hashes.SHA256`).
+    """
+    url = f"{CIVITAI_API_BASE}/model-versions/{version_id}"
+    headers = {"User-Agent": "comfy-gen-handler/0.2"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, TimeoutError) as exc:
+        print(f"[civitai] version-metadata lookup failed for {version_id}: "
+              f"{type(exc).__name__}: {exc}", flush=True)
+        return None
+
+    files = data.get("files") or []
+    if not files:
+        return None
+    # Prefer the explicitly-primary file; otherwise the first one. This is
+    # also what download_with_aria.py picks.
+    primary = next((f for f in files if f.get("primary")), files[0])
+    sha = (primary.get("hashes") or {}).get("SHA256")
+    name = primary.get("name")
+    if not sha or not name:
+        return None
+    return {"filename": name, "sha256": sha.lower()}
+
+
+def _find_file_by_sha(dest_dir: str, expected_sha: str, hint_name: str | None = None) -> str | None:
+    """Return the path of a file under `dest_dir` whose SHA256 matches.
+
+    Tries `hint_name` first (1 hash op) when supplied — that's the common path
+    when the CivitAI API tells us the filename. Falls back to scanning every
+    regular file in the directory (excluding `.aria2` partials and dotfiles).
+    Returns None if no match.
+    """
+    if not os.path.isdir(dest_dir):
+        return None
+    expected_sha = expected_sha.lower()
+    if hint_name:
+        candidate = os.path.join(dest_dir, hint_name)
+        if os.path.isfile(candidate):
+            try:
+                if _sha256_file(candidate) == expected_sha:
+                    return candidate
+            except OSError:
+                pass
+    for name in sorted(os.listdir(dest_dir)):
+        if name.startswith(".") or name.endswith(".aria2"):
+            continue
+        if hint_name and name == hint_name:
+            continue  # already checked above
+        full = os.path.join(dest_dir, name)
+        if not os.path.isfile(full):
+            continue
+        try:
+            if _sha256_file(full) == expected_sha:
+                return full
+        except OSError:
+            continue
+    return None
 
 
 def _sha256_file(path: str) -> str:
@@ -76,6 +153,7 @@ def _download_civitai(
     item_index: int = 0,
     total_items: int = 1,
     progress_callback: Callable[[dict], None] | None = None,
+    expected_sha: str | None = None,
 ) -> dict:
     """Download a model from CivitAI using download_with_aria.py.
 
@@ -99,7 +177,61 @@ def _download_civitai(
         Dict with filename, path, size_mb.
     """
     os.makedirs(dest_dir, exist_ok=True)
+    job_tag = (job.get("id", "")[:8] if job else "") or "civitai"
 
+    # --- Content-addressable dedup ------------------------------------------
+    # Mirror the URL download path's `cached: true` skip when a file matching
+    # the expected SHA256 already exists. Source of truth for the expected
+    # hash, in priority:
+    #   1. `expected_sha` arg (caller — e.g. blockflow-presets explicit hash)
+    #   2. CivitAI API's per-file hashes.SHA256 (one extra ~100ms GET to avoid
+    #      a 5-30min subprocess download). Schema confirmed via Context7.
+    # Either way: if a file in dest_dir hashes to the expected SHA, return it
+    # with cached=True and skip the subprocess entirely.
+    dedup_target_sha = (expected_sha or "").lower() or None
+    api_filename: str | None = None
+    if not dedup_target_sha:
+        meta = _civitai_version_metadata(
+            version_id, token=os.environ.get("CIVITAI_TOKEN") or None,
+        )
+        if meta:
+            dedup_target_sha = meta["sha256"]
+            api_filename = meta["filename"]
+            print(f"[job {job_tag}] civitai: api reports {api_filename} "
+                  f"sha256={dedup_target_sha[:12]}…", flush=True)
+
+    if dedup_target_sha:
+        cached_hit = _find_file_by_sha(dest_dir, dedup_target_sha, hint_name=api_filename)
+        if cached_hit:
+            size_mb = round(os.path.getsize(cached_hit) / (1024 * 1024), 1)
+            print(f"[job {job_tag}] civitai: cached hit — sha256 match for "
+                  f"{os.path.basename(cached_hit)}; skipping download.", flush=True)
+            if job:
+                _send_progress(
+                    job,
+                    f"Cached {item_index+1}/{total_items}: "
+                    f"{os.path.basename(cached_hit)} (sha256 match)",
+                    percent=((item_index + 1) / total_items) * 100,
+                )
+            if progress_callback:
+                progress_callback({
+                    "type": "download_done",
+                    "file_index": item_index,
+                    "file": os.path.basename(cached_hit),
+                    "cached": True,
+                    "bytes": os.path.getsize(cached_hit),
+                    "sha256": dedup_target_sha,
+                })
+            return {
+                "filename": os.path.basename(cached_hit),
+                "path": cached_hit,
+                "size_mb": size_mb,
+                "cached": True,
+                "sha256": dedup_target_sha,
+            }
+
+    # ------------------------------------------------------------------------
+    # No cached hit — proceed with the subprocess download.
     # List files before download as a fallback for detecting what landed.
     # Primary path: parse the CivitAI script's "Model ready at: <path>" line.
     # Diff is unreliable when a prior attempt left files in the dest (resume
@@ -107,8 +239,6 @@ def _download_civitai(
     # empty even though the download succeeded.
     before = set(os.listdir(dest_dir)) if os.path.isdir(dest_dir) else set()
     model_ready_path: str | None = None
-
-    job_tag = (job.get("id", "")[:8] if job else "") or "civitai"
 
     proc = subprocess.Popen(
         ["python3", "-u", CIVITAI_SCRIPT, "-m", str(version_id), "-o", dest_dir],
@@ -153,24 +283,28 @@ def _download_civitai(
                 item_pct = (dl_pct / 100) * (100 / total_items)
                 overall_pct = base_pct + item_pct
                 speed_str = f" ({speed}/s)" if speed else ""
+                # Prefer the real filename (from CivitAI API) over the abstract
+                # civitai/<vid> token in progress messages.
+                display_name = api_filename or f"civitai/{version_id}"
                 if job:
                     _send_progress(
                         job,
                         f"Downloading {item_index+1}/{total_items}: "
-                        f"civitai/{version_id} {dl_pct}%{speed_str}",
+                        f"{display_name} {dl_pct}%{speed_str}",
                         percent=overall_pct,
                     )
                 if progress_callback:
                     progress_callback({
                         "type": "download_progress",
                         "file_index": item_index,
-                        "file": f"civitai/{version_id}",
+                        "file": display_name,
                         "percent": dl_pct,
                         "speed": speed or "",
                     })
             elif (now - last_heartbeat_time) >= HEARTBEAT_SEC:
                 last_heartbeat_time = now
-                print(f"[job {job_tag}] civitai: ... still downloading version {version_id}", flush=True)
+                heartbeat_name = api_filename or f"version {version_id}"
+                print(f"[job {job_tag}] civitai: ... still downloading {heartbeat_name}", flush=True)
     except Exception as exc:  # noqa: BLE001 — surface and re-raise via returncode below
         print(f"[job {job_tag}] civitai: stream error: {type(exc).__name__}: {exc}", flush=True)
 
@@ -457,8 +591,13 @@ def handle(job: dict, progress_callback: Callable[[dict], None] | None = None) -
                 timeout_sec=subprocess_timeout,
                 job=job, item_index=i, total_items=len(downloads),
                 progress_callback=progress_callback,
+                expected_sha=expected_sha,
             )
-            cached = False
+            cached = bool(info.pop("cached", False))
+            # When the dedup path served the file, record the API-reported sha
+            # on the result so the post-loop sha-verify branch sees it.
+            if cached and "sha256" in info:
+                expected_sha = info["sha256"]
 
         elif source == "url":
             url = dl.get("url")
