@@ -68,14 +68,32 @@ def _send_progress(job: dict, message: str, percent: float = 0) -> None:
         pass
 
 
-def _download_civitai(version_id: str, dest_dir: str, timeout_sec: int = 600) -> dict:
+def _download_civitai(
+    version_id: str,
+    dest_dir: str,
+    timeout_sec: int = 600,
+    job: dict | None = None,
+    item_index: int = 0,
+    total_items: int = 1,
+    progress_callback: Callable[[dict], None] | None = None,
+) -> dict:
     """Download a model from CivitAI using download_with_aria.py.
+
+    Streams the subprocess's stdout/stderr line-by-line so multi-GB downloads
+    aren't silent for their full duration. aria2c-style progress lines emitted
+    by the underlying script are parsed (via `_parse_aria2c_progress`) and
+    surfaced as `download_progress` events through `progress_callback`.
 
     Args:
         version_id: CivitAI model version ID.
         dest_dir: Absolute path to destination directory.
         timeout_sec: Subprocess timeout. Orchestrator-controlled per job
             (BlockFlow computes ~`300 + size_gb * 60`); 600 is a safe minimum.
+        job: RunPod job dict — used for progress_update messages and to tag
+            stdout lines with the job id.
+        item_index: 0-based index of this download in the batch (for overall %).
+        total_items: Total number of downloads in this batch.
+        progress_callback: Optional event sink (SSE forwarder in install-preset).
 
     Returns:
         Dict with filename, path, size_mb.
@@ -85,17 +103,71 @@ def _download_civitai(version_id: str, dest_dir: str, timeout_sec: int = 600) ->
     # List files before download to detect the new file
     before = set(os.listdir(dest_dir)) if os.path.isdir(dest_dir) else set()
 
-    result = subprocess.run(
-        ["python3", CIVITAI_SCRIPT, "-m", str(version_id), "-o", dest_dir],
-        capture_output=True,
+    job_tag = (job.get("id", "")[:8] if job else "") or "civitai"
+
+    proc = subprocess.Popen(
+        ["python3", "-u", CIVITAI_SCRIPT, "-m", str(version_id), "-o", dest_dir],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
-        timeout=timeout_sec,
+        bufsize=1,  # line-buffered
     )
 
-    if result.returncode != 0:
+    output_lines: list[str] = []
+    last_progress_time = 0.0
+    last_heartbeat_time = time.time()
+    HEARTBEAT_SEC = 15  # log "still running" every 15s even on silent output
+
+    try:
+        assert proc.stdout is not None
+        for raw in proc.stdout:
+            line = raw.rstrip()
+            if not line:
+                continue
+            output_lines.append(line)
+            # Surface every line to the worker log so RunPod's log viewer shows
+            # live progress. The script's own format (aria2c summary lines,
+            # status messages from CivitAI_Downloader) is the most useful thing
+            # we can show — anything more structured would risk drift.
+            print(f"[job {job_tag}] civitai: {line}", flush=True)
+
+            now = time.time()
+            parsed = _parse_aria2c_progress(line)
+            if parsed and (now - last_progress_time) >= 3:
+                dl_pct, speed = parsed
+                last_progress_time = now
+                last_heartbeat_time = now
+                base_pct = (item_index / total_items) * 100
+                item_pct = (dl_pct / 100) * (100 / total_items)
+                overall_pct = base_pct + item_pct
+                speed_str = f" ({speed}/s)" if speed else ""
+                if job:
+                    _send_progress(
+                        job,
+                        f"Downloading {item_index+1}/{total_items}: "
+                        f"civitai/{version_id} {dl_pct}%{speed_str}",
+                        percent=overall_pct,
+                    )
+                if progress_callback:
+                    progress_callback({
+                        "type": "download_progress",
+                        "file_index": item_index,
+                        "file": f"civitai/{version_id}",
+                        "percent": dl_pct,
+                        "speed": speed or "",
+                    })
+            elif (now - last_heartbeat_time) >= HEARTBEAT_SEC:
+                last_heartbeat_time = now
+                print(f"[job {job_tag}] civitai: ... still downloading version {version_id}", flush=True)
+    except Exception as exc:  # noqa: BLE001 — surface and re-raise via returncode below
+        print(f"[job {job_tag}] civitai: stream error: {type(exc).__name__}: {exc}", flush=True)
+
+    proc.wait(timeout=timeout_sec)
+
+    if proc.returncode != 0:
+        tail = "\n".join(output_lines[-20:]).strip()
         raise RuntimeError(
-            f"CivitAI download failed (exit {result.returncode}): "
-            f"{result.stderr.strip() or result.stdout.strip()}"
+            f"CivitAI download failed (exit {proc.returncode}): {tail}"
         )
 
     # Find newly downloaded file(s)
@@ -103,9 +175,9 @@ def _download_civitai(version_id: str, dest_dir: str, timeout_sec: int = 600) ->
     new_files = after - before
 
     if not new_files:
+        tail = "\n".join(output_lines[-20:]).strip()
         raise RuntimeError(
-            f"CivitAI download produced no new files. "
-            f"stdout: {result.stdout.strip()}"
+            f"CivitAI download produced no new files. tail: {tail}"
         )
 
     # Return info about the first new file (usually there's only one)
@@ -358,7 +430,12 @@ def handle(job: dict, progress_callback: Callable[[dict], None] | None = None) -
             if not version_id:
                 raise RuntimeError(f"Download {i+1}: 'version_id' required for civitai source")
             print(f"[job {job_id[:8]}] CivitAI download: version {version_id} -> {dest}")
-            info = _download_civitai(str(version_id), dest_dir, timeout_sec=subprocess_timeout)
+            info = _download_civitai(
+                str(version_id), dest_dir,
+                timeout_sec=subprocess_timeout,
+                job=job, item_index=i, total_items=len(downloads),
+                progress_callback=progress_callback,
+            )
             cached = False
 
         elif source == "url":
