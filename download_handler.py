@@ -110,6 +110,31 @@ def _sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
+def _sha256_file_with_heartbeat(
+    path: str, job_tag: str, label: str, heartbeat_sec: float = 15.0,
+) -> str:
+    """Like _sha256_file but emits a heartbeat every heartbeat_sec seconds so
+    multi-GB hashes over a network volume don't go dark. Used for the
+    post-download verify path which can take minutes on large files (bead 8r7)."""
+    h = hashlib.sha256()
+    started = time.time()
+    last_beat = started
+    bytes_so_far = 0
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(64 * 1024), b""):
+            h.update(chunk)
+            bytes_so_far += len(chunk)
+            now = time.time()
+            if now - last_beat >= heartbeat_sec:
+                last_beat = now
+                mb = bytes_so_far / (1024 * 1024)
+                elapsed = now - started
+                rate = mb / elapsed if elapsed > 0 else 0
+                print(f"[job {job_tag}] still hashing {label} — "
+                      f"{mb:.0f}MB at {rate:.0f}MB/s ({elapsed:.0f}s in)", flush=True)
+    return h.hexdigest()
+
+
 def _split_destination_path(destination_path: str) -> tuple[str, str]:
     """Split a `destination_path` into (dest_subdir, filename).
 
@@ -168,8 +193,9 @@ def _download_civitai(
     Returns:
         Dict with filename, path, size_mb.
     """
-    os.makedirs(dest_dir, exist_ok=True)
     job_tag = (job.get("id", "")[:8] if job else "") or "civitai"
+    print(f"[job {job_tag}] civitai: entering _download_civitai for version {version_id}", flush=True)
+    os.makedirs(dest_dir, exist_ok=True)
 
     # --- Content-addressable dedup ------------------------------------------
     # Mirror the URL download path's `cached: true` skip when a file matching
@@ -628,8 +654,17 @@ def handle(job: dict, progress_callback: Callable[[dict], None] | None = None) -
                 f"Use 'civitai', 'url', or 'huggingface' (alias for 'url').")
 
         # Post-download sha256 verification (skip if we just confirmed via cache).
+        # Heartbeats every 15s — on multi-GB files over a network volume this
+        # step can take minutes, and without logging the job looks hung between
+        # the script's "Model ready at:" line and our "Downloaded:" log (bead 8r7).
         if expected_sha and not cached:
-            actual_sha = _sha256_file(info["path"])
+            size_mb = round(os.path.getsize(info["path"]) / (1024 * 1024), 1)
+            print(f"[job {job_id[:8]}] Verifying sha256 of {info['filename']} ({size_mb} MB)...", flush=True)
+            verify_started = time.time()
+            actual_sha = _sha256_file_with_heartbeat(
+                info["path"], job_id[:8], info["filename"],
+            )
+            verify_elapsed = int(time.time() - verify_started)
             if actual_sha != expected_sha:
                 try:
                     os.unlink(info["path"])
@@ -639,6 +674,7 @@ def handle(job: dict, progress_callback: Callable[[dict], None] | None = None) -
                     f"Download {i+1}: sha256 mismatch for {info['filename']}: "
                     f"expected {expected_sha}, got {actual_sha}. Corrupt file removed."
                 )
+            print(f"[job {job_id[:8]}] sha256 verified for {info['filename']} in {verify_elapsed}s", flush=True)
             info["sha256"] = actual_sha
         elif expected_sha and cached:
             info["sha256"] = expected_sha
