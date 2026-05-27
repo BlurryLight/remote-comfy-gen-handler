@@ -264,13 +264,6 @@ def _download_civitai(
         size_mb = round(os.path.getsize(cached_hit) / (1024 * 1024), 1)
         print(f"[job {job_tag}] civitai: cached hit — sha256 match for "
               f"{os.path.basename(cached_hit)}; skipping download.", flush=True)
-        if job:
-            _send_progress(
-                job,
-                f"Cached {item_index+1}/{total_items}: "
-                f"{os.path.basename(cached_hit)} (sha256 match)",
-                percent=((item_index + 1) / total_items) * 100,
-            )
         if progress_callback:
             progress_callback({
                 "type": "download_done",
@@ -633,6 +626,20 @@ def handle(job: dict, progress_callback: Callable[[dict], None] | None = None) -
     # the final order matches the input order even though completions are
     # interleaved.
     results_by_index: dict[int, dict] = {}
+    progress_state = {"completed": 0}
+    progress_state_lock = threading.Lock()
+
+    def _send_file_done_progress(info: dict) -> None:
+        with progress_state_lock:
+            progress_state["completed"] += 1
+            completed = progress_state["completed"]
+        verb = "Cached" if info.get("cached") else "Downloaded"
+        suffix = " (sha256 match)" if info.get("cached") and info.get("sha256") else ""
+        _send_progress(
+            job,
+            f"{verb} {completed}/{len(downloads)}: {info['filename']}{suffix}",
+            percent=(completed / len(downloads)) * 100,
+        )
 
     def _run_one(idx: int, dl: dict) -> dict:
         source = dl.get("source", "")
@@ -725,6 +732,7 @@ def handle(job: dict, progress_callback: Callable[[dict], None] | None = None) -
         info["cached"] = cached
         info["bytes"] = os.path.getsize(info["path"])
         print(f"[job {job_id[:8]}] Downloaded: {info['filename']} ({info['size_mb']} MB, cached={cached})")
+        _send_file_done_progress(info)
         if progress_callback:
             with _PROGRESS_LOCK:
                 progress_callback({
