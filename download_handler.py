@@ -67,13 +67,20 @@ def _civitai_version_metadata(version_id: str, token: str | None = None) -> dict
     if not files:
         return None
     # Prefer the explicitly-primary file; otherwise the first one. This is
-    # also what download_with_aria.py picks.
+    # the same file the wrapped download_with_aria.py script would pick.
     primary = next((f for f in files if f.get("primary")), files[0])
     sha = (primary.get("hashes") or {}).get("SHA256")
     name = primary.get("name")
-    if not sha or not name:
+    # downloadUrl on the file entry; if absent, fall back to the version-level
+    # downloadUrl (CivitAI exposes both in different shapes).
+    download_url = primary.get("downloadUrl") or data.get("downloadUrl")
+    if not sha or not name or not download_url:
         return None
-    return {"filename": name, "sha256": sha.lower()}
+    return {
+        "filename": name,
+        "sha256": sha.lower(),
+        "download_url": download_url,
+    }
 
 
 def _find_file_by_sha(dest_dir: str, expected_sha: str, hint_name: str | None = None) -> str | None:
@@ -218,198 +225,92 @@ def _download_civitai(
     progress_callback: Callable[[dict], None] | None = None,
     expected_sha: str | None = None,
 ) -> dict:
-    """Download a model from CivitAI using download_with_aria.py.
+    """Download a CivitAI model directly via aria2c, with in-flight checksum.
 
-    Streams the subprocess's stdout/stderr line-by-line so multi-GB downloads
-    aren't silent for their full duration. aria2c-style progress lines emitted
-    by the underlying script are parsed (via `_parse_aria2c_progress`) and
-    surfaced as `download_progress` events through `progress_callback`.
+    Resolves the version's primary file metadata via the CivitAI API
+    (filename, sha256, downloadUrl), then hands off to `_download_url` with
+    `expected_sha` set so aria2c verifies in-flight. No wrapped script, no
+    post-download re-hash, no async verify queue. Same code path as URL/HF
+    downloads — auth is added via aria2c's --header flag when CIVITAI_TOKEN
+    is set.
 
-    Args:
-        version_id: CivitAI model version ID.
-        dest_dir: Absolute path to destination directory.
-        timeout_sec: Subprocess timeout. Orchestrator-controlled per job
-            (BlockFlow computes ~`300 + size_gb * 60`); 600 is a safe minimum.
-        job: RunPod job dict — used for progress_update messages and to tag
-            stdout lines with the job id.
-        item_index: 0-based index of this download in the batch (for overall %).
-        total_items: Total number of downloads in this batch.
-        progress_callback: Optional event sink (SSE forwarder in install-preset).
-
-    Returns:
-        Dict with filename, path, size_mb.
+    Returns a dict with `filename`, `path`, `size_mb`, plus `cached: True` and
+    `sha256` when the dedup fast-path served the file from disk.
     """
     job_tag = (job.get("id", "")[:8] if job else "") or "civitai"
     print(f"[job {job_tag}] civitai: entering _download_civitai for version {version_id}", flush=True)
     os.makedirs(dest_dir, exist_ok=True)
 
-    # --- Content-addressable dedup ------------------------------------------
-    # Mirror the URL download path's `cached: true` skip when a file matching
-    # the expected SHA256 already exists. Source of truth for the expected
-    # hash, in priority:
-    #   1. `expected_sha` arg (caller — e.g. blockflow-presets explicit hash)
-    #   2. CivitAI API's per-file hashes.SHA256 (one extra ~100ms GET to avoid
-    #      a 5-30min subprocess download). Schema confirmed via Context7.
-    # Either way: if a file in dest_dir hashes to the expected SHA, return it
-    # with cached=True and skip the subprocess entirely.
-    dedup_target_sha = (expected_sha or "").lower() or None
-    api_filename: str | None = None
-    if not dedup_target_sha:
-        meta = _civitai_version_metadata(
-            version_id, token=os.environ.get("CIVITAI_TOKEN") or None,
-        )
-        if meta:
-            dedup_target_sha = meta["sha256"]
-            api_filename = meta["filename"]
-            print(f"[job {job_tag}] civitai: api reports {api_filename} "
-                  f"sha256={dedup_target_sha[:12]}…", flush=True)
-
-    if dedup_target_sha:
-        cached_hit = _find_file_by_sha(dest_dir, dedup_target_sha, hint_name=api_filename)
-        if cached_hit:
-            size_mb = round(os.path.getsize(cached_hit) / (1024 * 1024), 1)
-            print(f"[job {job_tag}] civitai: cached hit — sha256 match for "
-                  f"{os.path.basename(cached_hit)}; skipping download.", flush=True)
-            if job:
-                _send_progress(
-                    job,
-                    f"Cached {item_index+1}/{total_items}: "
-                    f"{os.path.basename(cached_hit)} (sha256 match)",
-                    percent=((item_index + 1) / total_items) * 100,
-                )
-            if progress_callback:
-                progress_callback({
-                    "type": "download_done",
-                    "file_index": item_index,
-                    "file": os.path.basename(cached_hit),
-                    "cached": True,
-                    "bytes": os.path.getsize(cached_hit),
-                    "sha256": dedup_target_sha,
-                })
-            return {
-                "filename": os.path.basename(cached_hit),
-                "path": cached_hit,
-                "size_mb": size_mb,
-                "cached": True,
-                "sha256": dedup_target_sha,
-            }
-
-    # ------------------------------------------------------------------------
-    # No cached hit — proceed with the subprocess download.
-    # List files before download as a fallback for detecting what landed.
-    # Primary path: parse the CivitAI script's "Model ready at: <path>" line.
-    # Diff is unreliable when a prior attempt left files in the dest (resume
-    # case): aria2c writes the same filename in place and `after - before` is
-    # empty even though the download succeeded.
-    before = set(os.listdir(dest_dir)) if os.path.isdir(dest_dir) else set()
-    model_ready_path: str | None = None
-
-    proc = subprocess.Popen(
-        ["python3", "-u", CIVITAI_SCRIPT, "-m", str(version_id), "-o", dest_dir],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,  # line-buffered
-    )
-
-    output_lines: list[str] = []
-    last_progress_time = 0.0
-    last_heartbeat_time = time.time()
-    HEARTBEAT_SEC = 15  # log "still running" every 15s even on silent output
-
-    try:
-        assert proc.stdout is not None
-        for raw in proc.stdout:
-            line = raw.rstrip()
-            if not line:
-                continue
-            output_lines.append(line)
-            # The script emits "✅ Model ready at: /abs/path/to/file" on success.
-            # Capture the path so we don't need to guess from a directory diff.
-            if "Model ready at:" in line and model_ready_path is None:
-                _, _, path_part = line.partition("Model ready at:")
-                candidate = path_part.strip()
-                if candidate and os.path.isfile(candidate):
-                    model_ready_path = candidate
-            # Surface every line to the worker log so RunPod's log viewer shows
-            # live progress. The script's own format (aria2c summary lines,
-            # status messages from CivitAI_Downloader) is the most useful thing
-            # we can show — anything more structured would risk drift.
-            print(f"[job {job_tag}] civitai: {line}", flush=True)
-
-            now = time.time()
-            parsed = _parse_aria2c_progress(line)
-            if parsed and (now - last_progress_time) >= 3:
-                dl_pct, speed = parsed
-                last_progress_time = now
-                last_heartbeat_time = now
-                base_pct = (item_index / total_items) * 100
-                item_pct = (dl_pct / 100) * (100 / total_items)
-                overall_pct = base_pct + item_pct
-                speed_str = f" ({speed}/s)" if speed else ""
-                # Prefer the real filename (from CivitAI API) over the abstract
-                # civitai/<vid> token in progress messages.
-                display_name = api_filename or f"civitai/{version_id}"
-                if job:
-                    _send_progress(
-                        job,
-                        f"Downloading {item_index+1}/{total_items}: "
-                        f"{display_name} {dl_pct}%{speed_str}",
-                        percent=overall_pct,
-                    )
-                if progress_callback:
-                    progress_callback({
-                        "type": "download_progress",
-                        "file_index": item_index,
-                        "file": display_name,
-                        "percent": dl_pct,
-                        "speed": speed or "",
-                    })
-            elif (now - last_heartbeat_time) >= HEARTBEAT_SEC:
-                last_heartbeat_time = now
-                heartbeat_name = api_filename or f"version {version_id}"
-                print(f"[job {job_tag}] civitai: ... still downloading {heartbeat_name}", flush=True)
-    except Exception as exc:  # noqa: BLE001 — surface and re-raise via returncode below
-        print(f"[job {job_tag}] civitai: stream error: {type(exc).__name__}: {exc}", flush=True)
-
-    proc.wait(timeout=timeout_sec)
-
-    if proc.returncode != 0:
-        tail = "\n".join(output_lines[-20:]).strip()
+    token = os.environ.get("CIVITAI_TOKEN") or None
+    meta = _civitai_version_metadata(version_id, token=token)
+    if meta is None:
         raise RuntimeError(
-            f"CivitAI download failed (exit {proc.returncode}): {tail}"
+            f"CivitAI API metadata lookup failed for version {version_id}. "
+            f"Verify CIVITAI_TOKEN is set if the model is gated."
         )
+    api_filename = meta["filename"]
+    api_sha = meta["sha256"]
+    download_url = meta["download_url"]
+    # Caller-supplied sha256 wins if explicit; otherwise trust the API.
+    effective_sha = (expected_sha or api_sha).lower()
+    print(f"[job {job_tag}] civitai: api reports {api_filename} "
+          f"sha256={effective_sha[:12]}… url={download_url}", flush=True)
 
-    # Resolve the resulting file.
-    # Priority 1: the script told us the path via "Model ready at:".
-    # Priority 2: directory diff (works for clean dests).
-    # Priority 3: if both fail, treat any newly-mtime'd .safetensors/.gguf/.bin
-    #             as a fallback — last-ditch, but covers resume cases where
-    #             aria2c wrote the same filename twice.
-    if model_ready_path:
-        filepath = model_ready_path
-        filename = os.path.basename(filepath)
-    else:
-        after = set(os.listdir(dest_dir)) if os.path.isdir(dest_dir) else set()
-        # Ignore aria2's partial-state files when picking the result.
-        new_files = {f for f in (after - before) if not f.endswith(".aria2")}
-        if new_files:
-            filename = sorted(new_files)[0]
-            filepath = os.path.join(dest_dir, filename)
-        else:
-            tail = "\n".join(output_lines[-20:]).strip()
-            raise RuntimeError(
-                f"CivitAI download produced no new files and no 'Model ready at:' "
-                f"line was emitted. tail: {tail}"
+    # Content-addressable dedup: file already at <dest_dir>/<api_filename>
+    # with matching sha → return cached, no download.
+    cached_hit = _find_file_by_sha(dest_dir, effective_sha, hint_name=api_filename)
+    if cached_hit:
+        size_mb = round(os.path.getsize(cached_hit) / (1024 * 1024), 1)
+        print(f"[job {job_tag}] civitai: cached hit — sha256 match for "
+              f"{os.path.basename(cached_hit)}; skipping download.", flush=True)
+        if job:
+            _send_progress(
+                job,
+                f"Cached {item_index+1}/{total_items}: "
+                f"{os.path.basename(cached_hit)} (sha256 match)",
+                percent=((item_index + 1) / total_items) * 100,
             )
+        if progress_callback:
+            progress_callback({
+                "type": "download_done",
+                "file_index": item_index,
+                "file": os.path.basename(cached_hit),
+                "cached": True,
+                "bytes": os.path.getsize(cached_hit),
+                "sha256": effective_sha,
+            })
+        return {
+            "filename": os.path.basename(cached_hit),
+            "path": cached_hit,
+            "size_mb": size_mb,
+            "cached": True,
+            "sha256": effective_sha,
+        }
 
-    size_mb = round(os.path.getsize(filepath) / (1024 * 1024), 1)
+    # Cache miss — direct aria2c with in-flight --checksum. Auth header is
+    # added when CIVITAI_TOKEN is set (gated models). Reuses _download_url's
+    # streaming progress + retry semantics.
+    extra_args: list[str] = []
+    if token:
+        extra_args.append(f"--header=Authorization: Bearer {token}")
 
-    return {
-        "filename": filename,
-        "path": filepath,
-        "size_mb": size_mb,
-    }
+    info = _download_url(
+        url=download_url,
+        dest_dir=dest_dir,
+        filename=api_filename,
+        job=job,
+        item_index=item_index,
+        total_items=total_items,
+        progress_callback=progress_callback,
+        timeout_sec=timeout_sec,
+        expected_sha=effective_sha,
+        extra_aria_args=extra_args,
+    )
+    # aria2c --checksum verified in-flight, so we can record the sha now
+    # without a second pass over the file.
+    info["sha256"] = effective_sha
+    return info
+
 
 
 def _parse_aria2c_progress(line: str) -> tuple[float, str] | None:
@@ -442,6 +343,7 @@ def _download_url(
     progress_callback: Callable[[dict], None] | None = None,
     timeout_sec: int = 600,
     expected_sha: str | None = None,
+    extra_aria_args: list[str] | None = None,
 ) -> dict:
     """Download a file from a direct URL using aria2c with progress streaming.
 
@@ -478,6 +380,8 @@ def _download_url(
     ]
     if expected_sha:
         aria_cmd.append(f"--checksum=sha-256={expected_sha.lower()}")
+    if extra_aria_args:
+        aria_cmd.extend(extra_aria_args)
     aria_cmd.append(url)
 
     # Stream aria2c output to capture real-time progress
@@ -729,23 +633,17 @@ def handle(job: dict, progress_callback: Callable[[dict], None] | None = None) -
                 f"Download {idx+1}: unknown source '{dl.get('source','')}'. "
                 f"Use 'civitai', 'url', or 'huggingface' (alias for 'url').")
 
-        # sha256 settlement: cached → trust; URL with sha → aria2c verified
-        # in-flight; CivitAI with sha → async verify on the dedicated pool.
+        # sha256 settlement (post-746a21e architecture): both url and civitai
+        # paths use aria2c --checksum for in-flight verification, so by the
+        # time _download_url/_download_civitai returns we already trust the
+        # sha. The civitai wrapper sets info["sha256"] from the API metadata;
+        # the url path's settlement we do here.
         if expected_sha and cached:
             info["sha256"] = expected_sha
         elif expected_sha and source == "url":
             info["sha256"] = expected_sha.lower()
             print(f"[job {job_id[:8]}] sha256 verified in-flight (aria2c --checksum) for {info['filename']}", flush=True)
-        elif expected_sha and source == "civitai":
-            size_mb = round(os.path.getsize(info["path"]) / (1024 * 1024), 1)
-            print(f"[job {job_id[:8]}] Verifying sha256 of {info['filename']} ({size_mb} MB) in background...", flush=True)
-            fut = _verify_pool().submit(
-                _async_verify_sha256,
-                info["path"], expected_sha.lower(),
-                job_tag=job_id[:8], label=info["filename"],
-            )
-            _pending_verifications.append((idx, info, fut, expected_sha.lower()))
-            info["sha256_pending"] = True
+        # source == "civitai" already has info["sha256"] set by _download_civitai
 
         info["dest"] = dest
         info["cached"] = cached
@@ -785,18 +683,14 @@ def handle(job: dict, progress_callback: Callable[[dict], None] | None = None) -
     # Reassemble in input order so the response shape matches non-parallel runs.
     results = [results_by_index[i] for i in range(len(downloads))]
 
-    # Drain async sha256 verifications. The CivitAI path submits these to a
-    # background pool so the next download can start immediately; we settle the
-    # results here so the whole batch succeeds-or-fails atomically.
+    # Async sha256 verify queue is dead in the post-746a21e architecture
+    # (both URL and CivitAI use aria2c --checksum for in-flight verification).
+    # Left as a safety drain in case any future code path still submits.
     if _pending_verifications:
-        print(f"[job {job_id[:8]}] Awaiting {len(_pending_verifications)} background sha256 verification(s)...", flush=True)
-        verify_wait_started = time.time()
-        for idx, info, fut, expected in _pending_verifications:
-            actual = fut.result()  # raises on mismatch — propagated to caller
+        for idx, info, fut, _ in _pending_verifications:
+            actual = fut.result()
             info["sha256"] = actual
             info.pop("sha256_pending", None)
-        verify_wait_elapsed = int(time.time() - verify_wait_started)
-        print(f"[job {job_id[:8]}] All sha256 verifications cleared in {verify_wait_elapsed}s", flush=True)
         _pending_verifications.clear()
 
     elapsed = int(time.time() - start_time)
