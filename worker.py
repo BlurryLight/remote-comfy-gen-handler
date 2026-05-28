@@ -827,6 +827,8 @@ def handler(job: dict) -> dict:
 
         SAMPLER_TYPES = {"KSampler", "KSamplerAdvanced", "SamplerCustom", "SamplerCustomAdvanced"}
 
+        # Closure attribute initialized once; survives ticks within one job.
+        # Reset would-be needed across jobs but each job rebinds on_progress.
         def on_progress(data):
             stage = data.get("stage", "executing")
             pct_raw = data.get("percent", 0)
@@ -867,7 +869,13 @@ def handler(job: dict) -> dict:
 
             _send_progress(job, stage, msg, percent=pct, **extra)
             prefix = f"({completed}/{total}) " if total > 0 and completed > 0 else ""
-            jlog.info(f"{stage}: {prefix}{msg}")
+            log_line = f"{stage}: {prefix}{msg}"
+            # Dedupe identical lines (bead 9oi): nodes like ImageUpscaleWithModel
+            # emit ~150 identical progress ticks per call. RunPod IN_PROGRESS
+            # still fires every tick — only the log is throttled.
+            if log_line != getattr(on_progress, '_last_line', None):
+                on_progress._last_line = log_line
+                jlog.info(log_line)
 
         history = comfy_client.poll_completion(
             prompt_id,

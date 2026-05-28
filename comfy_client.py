@@ -218,11 +218,15 @@ def _ws_poll_completion(
     finally:
         ws.close()
 
-    # Log if execution completed with fewer nodes than expected
+    # ComfyUI's executor only runs nodes reachable from output sinks, so
+    # `completed_nodes < nodes_to_execute` is NORMAL — disconnected branches
+    # and dead-graph nodes are correctly skipped. Reframe as informational
+    # (bead kz8); previously it logged WARNING and looked like a failure.
     if nodes_to_execute > 0 and completed_nodes < nodes_to_execute:
+        skipped = nodes_to_execute - completed_nodes
         print(
-            f"[comfy_client] WARNING: Partial execution — "
-            f"{completed_nodes}/{nodes_to_execute} nodes completed",
+            f"[comfy_client] Executed {completed_nodes}/{nodes_to_execute} nodes "
+            f"({skipped} skipped — disconnected/unreachable branches)",
             flush=True,
         )
 
